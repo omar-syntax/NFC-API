@@ -14,7 +14,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   } catch (err) {
     console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT env var');
   }
-} 
+}
 // Priority 2: Service Account File (for Local Dev)
 else {
   try {
@@ -156,6 +156,66 @@ app.post('/scan-face', async (req, res) => {
 
   } catch (err) {
     console.error('❌ /scan-face error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /students
+ * Fetch all students for local face matching
+ */
+app.get('/students', async (req, res) => {
+  try {
+    if (!db) return res.json([]);
+    const snapshot = await db.ref('students').once('value');
+    if (!snapshot.exists()) return res.json([]);
+    
+    // Convert object to array
+    const data = snapshot.val();
+    const students = Object.keys(data).map(id => ({
+      studentId: id,
+      ...data[id]
+    }));
+    
+    return res.json(students);
+  } catch (err) {
+    console.error('❌ /students error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /students
+ * Register a new student with face descriptor and nfcId
+ */
+app.post('/students', async (req, res) => {
+  const { name, className, nfcId, faceDescriptor } = req.body;
+
+  if (!name || !nfcId || !faceDescriptor) {
+    return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+  }
+
+  try {
+    if (!db) {
+      return res.json({ status: 'success', message: 'Registered in DEMO mode' });
+    }
+
+    const studentData = {
+      name,
+      class: className || 'Unknown',
+      nfcId,
+      faceDescriptor, // Array of 128 numbers
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    };
+
+    const newStudentRef = db.ref('students').push();
+    await newStudentRef.set(studentData);
+
+    console.log(`👤 New student registered: ${name} (${newStudentRef.key})`);
+    return res.json({ status: 'success', studentId: newStudentRef.key });
+
+  } catch (err) {
+    console.error('❌ /students POST error:', err.message);
     return res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });

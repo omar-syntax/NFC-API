@@ -29,6 +29,12 @@ const sampleStudents = [
     name: "Aisha",
     nfcId: "A1B2C3D4",
     faceDescriptors: [0.5, 0.12, -0.3]
+  },
+  {
+    id: "20240001",
+    name: "Omar (Admin/Real Card)",
+    nfcId: "AA223F02",
+    faceDescriptors: [0.0, 0.0, 0.0]
   }
 ];
 
