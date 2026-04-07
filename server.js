@@ -220,6 +220,85 @@ app.post('/students', async (req, res) => {
   }
 });
 
+/**
+ * GET /attendance/report
+ * Query attendance records for a specific date.
+ * Query params:
+ *   date  – YYYY-MM-DD (optional, defaults to today in Cairo time)
+ * Returns: { date, totalScans, totalUniqueStudents, students[], rawRecords[] }
+ */
+app.get('/attendance/report', async (req, res) => {
+  try {
+    if (!db) {
+      return res.json({ date: 'demo', totalScans: 0, totalUniqueStudents: 0, students: [], rawRecords: [] });
+    }
+
+    const CAIRO_OFFSET_MS = 2 * 60 * 60 * 1000; // UTC+2
+    let startTs, endTs, reportDate;
+
+    if (req.query.date && req.query.date !== 'today') {
+      const [y, m, d] = req.query.date.split('-').map(Number);
+      // Cairo midnight for that date, expressed in UTC ms
+      startTs = Date.UTC(y, m - 1, d, 0, 0, 0) - CAIRO_OFFSET_MS;
+      endTs   = startTs + 86400000 - 1;
+      reportDate = req.query.date;
+    } else {
+      // Today in Cairo
+      const cairoNow = Date.now() + CAIRO_OFFSET_MS;
+      const cairoMidnight = Math.floor(cairoNow / 86400000) * 86400000;
+      startTs = cairoMidnight - CAIRO_OFFSET_MS;
+      endTs   = startTs + 86400000 - 1;
+      const tmp = new Date(cairoMidnight);
+      reportDate = `${tmp.getUTCFullYear()}-${String(tmp.getUTCMonth() + 1).padStart(2, '0')}-${String(tmp.getUTCDate()).padStart(2, '0')}`;
+    }
+
+    const snapshot = await db.ref('attendance')
+      .orderByChild('timestamp')
+      .startAt(startTs)
+      .endAt(endTs)
+      .once('value');
+
+    const rawRecords = [];
+    if (snapshot.exists()) {
+      snapshot.forEach(child => {
+        rawRecords.push({ id: child.key, ...child.val() });
+      });
+    }
+
+    // Deduplicate – keep the FIRST check-in per student
+    const seen = new Set();
+    const uniqueStudents = [];
+    for (const r of rawRecords) {
+      if (!seen.has(r.studentId)) {
+        seen.add(r.studentId);
+        uniqueStudents.push({
+          studentId: r.studentId,
+          name: r.studentName,
+          method: r.method,
+          checkInTime: new Date(r.timestamp).toLocaleTimeString('en-EG', {
+            timeZone: 'Africa/Cairo',
+            hour: '2-digit',
+            minute: '2-digit'
+          })
+        });
+      }
+    }
+
+    console.log(`📊 /attendance/report – date: ${reportDate}, unique students: ${uniqueStudents.length}`);
+    return res.json({
+      date: reportDate,
+      totalScans: rawRecords.length,
+      totalUniqueStudents: uniqueStudents.length,
+      students: uniqueStudents,
+      rawRecords
+    });
+
+  } catch (err) {
+    console.error('❌ /attendance/report error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({ status: 'error', message: `Route ${req.method} ${req.path} not found` });
 });
