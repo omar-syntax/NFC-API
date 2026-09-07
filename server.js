@@ -91,13 +91,16 @@ function requireDeviceToken(req, res, next) {
 }
 
 /**
- * Protects the admin user-provisioning API (POST/DELETE /users).
- * The signed-in dashboard admin sends their Firebase ID token as
+ * Protects the back-office user-provisioning API (POST/DELETE /users).
+ * The signed-in dashboard user sends their Firebase ID token as
  * `Authorization: Bearer <idToken>`. We verify it server-side via the Admin
- * SDK and confirm the caller's role is `admin` before allowing the request.
- * This prevents non-admins (or unsigned users) from creating/promoting users.
+ * SDK and confirm the caller's role is a back-office role ('admin' or
+ * 'affairs') before allowing the request.
+ * This prevents students/parents (or unsigned users) from creating users.
+ * Finer-grained role checks (which roles a caller may create/delete) are done
+ * inside each route handler.
  */
-async function requireAdmin(req, res, next) {
+async function requireBackoffice(req, res, next) {
   const header = req.get('authorization') || '';
   const parts = header.split(' ');
   const token = parts.length === 2 && parts[0].toLowerCase() === 'bearer' ? parts[1] : null;
@@ -116,14 +119,14 @@ async function requireAdmin(req, res, next) {
 
     const callerSnap = await db.ref(`users/${callerId}`).once('value');
     const caller = callerSnap.val();
-    if (!caller || caller.role !== 'admin') {
-      return res.status(403).json({ status: 'error', message: 'Forbidden: admin role required' });
+    if (!caller || !['admin', 'affairs'].includes(caller.role)) {
+      return res.status(403).json({ status: 'error', message: 'Forbidden: back-office role required' });
     }
 
     req.auth = { uid: callerId, role: caller.role };
     return next();
   } catch (err) {
-    console.error('❌ requireAdmin error:', err.code || err.message);
+    console.error('❌ requireBackoffice error:', err.code || err.message);
     return res.status(401).json({ status: 'error', message: 'Invalid or expired token' });
   }
 }
@@ -413,7 +416,7 @@ app.get('/attendance/report', requireDeviceToken, async (req, res) => {
  * Never stores plaintext passwords — credentials live only in Firebase Auth.
  * Body: { id?, name, role, email, phone?, password?, linkedStudentId? }
  */
-app.post('/users', requireAdmin, async (req, res) => {
+app.post('/users', requireBackoffice, async (req, res) => {
   const { id, name, role, email, phone, password, linkedStudentId } = req.body;
 
   if (!name || !email) {
@@ -422,6 +425,13 @@ app.post('/users', requireAdmin, async (req, res) => {
   const validRoles = ['admin', 'affairs', 'behavior', 'student', 'parent'];
   if (!validRoles.includes(role)) {
     return res.status(400).json({ status: 'error', message: 'Invalid role' });
+  }
+
+  // Back-office role authorization:
+  //   - admin may provision/update any role.
+  //   - affairs may only provision/update student and parent accounts.
+  if (req.auth.role === 'affairs' && !['student', 'parent'].includes(role)) {
+    return res.status(403).json({ status: 'error', message: 'Forbidden: affairs can only manage student/parent accounts' });
   }
 
   try {
@@ -474,10 +484,14 @@ app.post('/users', requireAdmin, async (req, res) => {
  * DELETE /users/:id
  * Delete the Firebase Auth account and its profile node. Admin only.
  */
-app.delete('/users/:id', requireAdmin, async (req, res) => {
+app.delete('/users/:id', requireBackoffice, async (req, res) => {
   const { id } = req.params;
   if (!id) {
     return res.status(400).json({ status: 'error', message: 'id is required' });
+  }
+  // Deleting users is a sensitive operation: admin only.
+  if (req.auth.role !== 'admin') {
+    return res.status(403).json({ status: 'error', message: 'Forbidden: admin role required' });
   }
   try {
     if (!admin.apps.length) {
