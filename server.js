@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
+const { verifyLoginWidget, telegramName } = require('./telegram');
 
 // ─── Firebase Init ────────────────────────────────────────────────────────────
 let serviceAccount;
@@ -71,6 +72,12 @@ const CHECK_IN_DEADLINE = process.env.CHECK_IN_DEADLINE || '07:30';
 
 const DEVICE_TOKEN = process.env.DEVICE_TOKEN || '';
 
+// Telegram integration. The bot itself is owned by an n8n flow; this backend is
+// only an authorization gateway. TELEGRAM_BOT_TOKEN is used to verify Telegram
+// Login Widget payloads; N8N_AUTH_KEY secures the /telegram/check endpoint.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const N8N_AUTH_KEY = process.env.N8N_AUTH_KEY || '';
+
 /**
  * Protects device-facing endpoints (NFC scanner, tablet). Clients must send
  * the correct `x-device-token` header; comparison is done in constant time.
@@ -129,6 +136,26 @@ async function requireBackoffice(req, res, next) {
     console.error('❌ requireBackoffice error:', err.code || err.message);
     return res.status(401).json({ status: 'error', message: 'Invalid or expired token' });
   }
+}
+
+/**
+ * Protects the n8n-facing authorization endpoint (/telegram/check). The n8n
+ * flow sends the shared secret in `x-telegram-auth-key`; comparison is done in
+ * constant time. This endpoint is intentionally NOT behind the Firebase token
+ * flow — n8n has no signed-in dashboard user.
+ */
+function requireN8n(req, res, next) {
+  if (!N8N_AUTH_KEY) {
+    return res.status(503).json({ status: 'error', message: 'N8N_AUTH_KEY is not configured on the server' });
+  }
+  const provided = req.get('x-telegram-auth-key') || '';
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(N8N_AUTH_KEY);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (!ok) {
+    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+  }
+  return next();
 }
 
 // ─── Time helpers (Cairo = UTC+2) ────────────────────────────────────────────
@@ -462,6 +489,7 @@ app.post('/users', requireBackoffice, async (req, res) => {
       name,
       email,
       role,
+      active: true,
       phone: phone || '',
       linkedStudentId: linkedStudentId || null,
       createdAt: admin.database.ServerValue.TIMESTAMP
@@ -498,6 +526,11 @@ app.delete('/users/:id', requireBackoffice, async (req, res) => {
       return res.status(500).json({ status: 'error', message: 'Firebase not connected' });
     }
     await admin.auth().deleteUser(id);
+    const userSnap = await db.ref(`users/${id}`).once('value');
+    const user = userSnap.val();
+    if (user?.telegramUserId) {
+      await db.ref(`telegramLinks/${String(user.telegramUserId)}`).remove();
+    }
     await db.ref(`users/${id}`).remove();
     console.log(`🗑️  User deleted from Auth + users/${id}`);
     return res.json({ status: 'success' });
@@ -508,6 +541,214 @@ app.delete('/users/:id', requireBackoffice, async (req, res) => {
       await db.ref(`users/${id}`).remove();
       return res.json({ status: 'success' });
     }
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /telegram/link
+ * Link the signed-in back-office user's platform account to a Telegram account.
+ * The body is the raw object produced by Telegram's official Login Widget
+ * (`id, first_name, last_name, username, auth_date, hash`). The signature and
+ * freshness are verified server-side against the bot token, so a client-supplied
+ * Telegram ID is never trusted on its own. Only admin/affairs may link.
+ */
+app.post('/telegram/link', requireBackoffice, async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) {
+    return res.status(503).json({ status: 'error', message: 'TELEGRAM_BOT_TOKEN is not configured on the server' });
+  }
+
+  const payload = req.body || {};
+  if (!verifyLoginWidget(payload, TELEGRAM_BOT_TOKEN, Date.now())) {
+    return res.status(400).json({ status: 'error', message: 'Invalid Telegram authorization data' });
+  }
+
+  const telegramUserId = String(payload.id);
+  const uid = req.auth.uid;
+
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ status: 'error', message: 'Firebase not connected' });
+    }
+
+    // If this user already had a different Telegram account linked, drop it so
+    // the OLD id is freed for re-linking (but keep the link valid until step
+    // below completes — the new id owns the current session).
+    const userSnap = await db.ref(`users/${uid}`).once('value');
+    const user = userSnap.val() || {};
+    const staleId = user.telegramUserId ? String(user.telegramUserId) : null;
+
+    // Reserve the Telegram id atomically so one Telegram account can never end
+    // up linked to two platform users (race-safe under concurrent requests).
+    const linkRef = db.ref(`telegramLinks/${telegramUserId}`);
+    let takenByOther = false;
+    const result = await linkRef.transaction((current) => {
+      if (current && current.uid !== uid) {
+        takenByOther = true;
+        return undefined; // abort: existing link belongs to someone else
+      }
+      return { uid, linkedAt: Date.now() };
+    });
+
+    if (!result.committed) {
+      // Aborted. Re-check to distinguish "owned by another user" from
+      // "already linked to the same user" (idempotent re-link is allowed).
+      const existing = (await linkRef.once('value')).val();
+      if (existing && existing.uid !== uid) {
+        return res.status(409).json({ status: 'error', message: 'Telegram account is already linked to another user' });
+      }
+      takenByOther = false;
+    }
+
+    if (takenByOther) {
+      return res.status(409).json({ status: 'error', message: 'Telegram account is already linked to another user' });
+    }
+
+    const linkedAt = Date.now();
+    await linkRef.set({ uid, linkedAt });
+
+    const updates = {
+      telegramUserId: payload.id,
+      telegramUsername: payload.username || '',
+      telegramName: telegramName(payload),
+      telegramLinkedAt: linkedAt
+    };
+    if (staleId && staleId !== telegramUserId) {
+      await db.ref(`telegramLinks/${staleId}`).remove();
+    }
+    await db.ref(`users/${uid}`).update(updates);
+
+    console.log(`🔗 Telegram linked – ${req.auth.role} ${uid} ↔ tg ${telegramUserId}`);
+    return res.json({ status: 'success', telegramUserId });
+  } catch (err) {
+    console.error('❌ /telegram/link error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * DELETE /telegram/link
+ * Disconnect the signed-in user's account from Telegram. This immediately
+ * revokes bot access (the next /telegram/check finds no link).
+ */
+app.delete('/telegram/link', requireBackoffice, async (req, res) => {
+  const uid = req.auth.uid;
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ status: 'error', message: 'Firebase not connected' });
+    }
+    const userSnap = await db.ref(`users/${uid}`).once('value');
+    const user = userSnap.val() || {};
+    const oldId = user.telegramUserId ? String(user.telegramUserId) : null;
+
+    const updates = {
+      telegramUserId: null,
+      telegramUsername: null,
+      telegramName: null,
+      telegramLinkedAt: null
+    };
+    await db.ref(`users/${uid}`).update(updates);
+    if (oldId) {
+      await db.ref(`telegramLinks/${oldId}`).remove();
+    }
+
+    console.log(`🔗 Telegram unlinked – ${req.auth.role} ${uid}`);
+    return res.json({ status: 'success' });
+  } catch (err) {
+    console.error('❌ /telegram/link DELETE error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /telegram/status
+ * Return the current user's Telegram linking state.
+ */
+app.get('/telegram/status', requireBackoffice, async (req, res) => {
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ status: 'error', message: 'Firebase not connected' });
+    }
+    const userSnap = await db.ref(`users/${req.auth.uid}`).once('value');
+    const user = userSnap.val() || {};
+    const linked = Boolean(user.telegramUserId);
+    return res.json({
+      linked,
+      telegramUserId: linked ? user.telegramUserId : null,
+      telegramUsername: linked ? user.telegramUsername || null : null,
+      telegramName: linked ? user.telegramName || null : null,
+      telegramLinkedAt: linked ? user.telegramLinkedAt || null : null
+    });
+  } catch (err) {
+    console.error('❌ /telegram/status error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /telegram/check
+ * Authorization gateway for the n8n Telegram flow. Given the numeric Telegram
+ * user id that sent a message, returns whether that person may interact with
+ * the bot. Every call re-reads live platform data: link exists → linked user
+ * exists and is active → role is admin/affairs. No hardcoded whitelist.
+ * Secured by `x-telegram-auth-key` (shared secret with n8n), not the Firebase
+ * ID-token flow.
+ */
+app.get('/telegram/check', requireN8n, async (req, res) => {
+  const telegramUserId = String(req.query.telegram_user_id || '');
+  if (!telegramUserId) {
+    return res.status(400).json({ status: 'error', message: 'telegram_user_id is required' });
+  }
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ status: 'error', message: 'Firebase not connected' });
+    }
+    const linkSnap = await db.ref(`telegramLinks/${telegramUserId}`).once('value');
+    if (!linkSnap.exists()) {
+      console.log(`🔍 /telegram/check – denied (unlinked), tg ${telegramUserId}`);
+      return res.json({ authorized: false });
+    }
+    const link = linkSnap.val();
+    const userSnap = await db.ref(`users/${link.uid}`).once('value');
+    const user = userSnap.val();
+    if (!user || user.active === false || !['admin', 'affairs'].includes(user.role)) {
+      const reason = !user ? 'no user' : user.active === false ? 'inactive' : 'role';
+      console.log(`🔍 /telegram/check – denied (${reason}), tg ${telegramUserId}`);
+      return res.json({ authorized: false });
+    }
+    console.log(`🔍 /telegram/check – granted: tg ${telegramUserId} → ${user.role}`);
+    return res.json({ authorized: true, user: { uid: link.uid, name: user.name, role: user.role } });
+  } catch (err) {
+    console.error('❌ /telegram/check error:', err.message);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /users/:id/status
+ * Enable or disable an account. Disabling immediately revokes Telegram bot
+ * access (checked live on every /telegram/check) while keeping data intact.
+ * Admin only.
+ * Body: { active: boolean }
+ */
+app.post('/users/:id/status', requireBackoffice, async (req, res) => {
+  const { id } = req.params;
+  const { active } = req.body;
+  if (req.auth.role !== 'admin') {
+    return res.status(403).json({ status: 'error', message: 'Forbidden: admin role required' });
+  }
+  if (typeof active !== 'boolean') {
+    return res.status(400).json({ status: 'error', message: 'active must be a boolean' });
+  }
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ status: 'error', message: 'Firebase not connected' });
+    }
+    await db.ref(`users/${id}`).update({ active });
+    console.log(`⚙️  User ${id} active=${active}`);
+    return res.json({ status: 'success' });
+  } catch (err) {
+    console.error('❌ /users/:id/status error:', err.message);
     return res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
